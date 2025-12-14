@@ -1,11 +1,10 @@
 # app/main.py
-from fastapi import FastAPI, Depends, HTTPException, Query
+from fastapi import FastAPI, Depends, HTTPException, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from typing import List, Optional
 import requests
 import re
-
 from database import get_db, init_db
 from models import MethodicEntry, QAEntry
 from search import (
@@ -53,6 +52,12 @@ class ChatResponse(BaseModel):
     answer: str
     sources: List[MethodicSnippet]
     found_methodics: int
+
+    class UploadResponse(BaseModel):
+        id: int
+        title: str
+        author: str | None
+        content_snippet: str
 
 def detect_question_type(question: str) -> str:
     q = question.lower().strip()
@@ -201,6 +206,40 @@ def synthesize_answer(search_results: dict, question: str) -> str:
     # -------- ОБЩИЙ СЛУЧАЙ --------
     return core
 
+
+def parse_methodic_docx(file) -> dict:
+    """
+    Парсинг .docx файла методички с таблицей.
+    Возвращает dict с title, author, text.
+    """
+    doc = Document(file)
+
+    # Если есть таблицы, берём первую таблицу
+    if doc.tables:
+        table = doc.tables[0]
+        # Предполагаем, что первая строка таблицы — заголовки: Автор, Название, Текст
+        # Вторая строка — сами данные
+        if len(table.rows) < 2:
+            raise ValueError("В таблице недостаточно строк (ожидается хотя бы заголовок и данные)")
+
+        author = table.cell(1, 0).text.strip() or None
+        title = table.cell(1, 1).text.strip() or "Без названия"
+        text = table.cell(1, 2).text.strip() or ""
+
+    else:
+        # fallback на старый метод
+        paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+        if not paragraphs:
+            raise ValueError("Пустой документ")
+        author = paragraphs[0] if len(paragraphs) > 0 else None
+        title = paragraphs[1] if len(paragraphs) > 1 else "Без названия"
+        text = "\n".join(paragraphs[2:]) if len(paragraphs) > 2 else ""
+
+    return {
+        "title": title,
+        "author": author,
+        "text": text
+    }
 
 # ------------------ MAIN LOGIC ------------------
 @app.post("/chat", response_model=ChatResponse)
@@ -355,6 +394,86 @@ async def get_methodic(methodic_id: int, db: Session = Depends(get_db)):
         title=methodic.source_title or "Без названия",
         author=methodic.author,
         content_snippet=methodic.methodic_text or ""
+    )
+# ------------------ ADD METHODIC (DOCX UPLOAD) ------------------
+@app.post("/methodics/upload", response_model=MethodicSnippet)
+async def upload_methodic(
+        file: UploadFile = File(...),
+        db: Session = Depends(get_db)
+):
+    """
+    ### Загрузка методического документа (.docx)
+
+    Загружает, парсит и сохраняет новый методический материал в базу данных.
+    Это ключевой эндпоинт для наполнения базы знаний.
+
+    #### Ожидаемый формат входного файла (.docx)
+    Документ **обязательно** должен содержать **первую таблицу**, которая используется для извлечения метаданных и текста.
+
+    | Колонка 1 | Колонка 2 | Колонка 3 |
+    |---|---|---|
+    | **Автор** (Иванов А.А.) | **Название** (Методика анализа рисков) | **Текст** (Полный текст методики...) |
+
+    *Примечание: Если таблица отсутствует, используется fallback-логика парсинга первых абзацев.*
+
+    ---
+
+    #### Параметры Запроса (Body)
+
+    | Параметр | Тип | Описание | Обязательность |
+    |---|---|---|---|
+    | `file` | `binary` (.docx) | Файл методики. | **Да** |
+
+    #### 200 OK - Тело Ответа
+
+    Возвращает объект `MethodicSnippet`, представляющий сохраненную запись.
+
+    ```json
+    {
+        "id": 15,
+        "title": "Методика анализа рисков",
+        "author": "Сидоров П.А.",
+        "content_snippet": "Сохраненный текст методики, обрезанный до первых 300 символов..."
+    }
+    ```
+
+    #### Возможные Ошибки (HTTPException)
+
+    * **400 Bad Request**:
+        * **Детали**: `"Можно загружать только .docx файлы"` (Неверный формат файла).
+        * **Детали**: `"Ошибка чтения файла: [сообщение об ошибке]"` (Пустой документ, неверная структура таблицы, или другие ошибки парсинга).
+    """
+
+
+    if not file.filename.lower().endswith(".docx"):
+        raise HTTPException(status_code=400, detail="Можно загружать только .docx файлы")
+
+    try:
+        parsed = parse_methodic_docx(file.file)
+        title = parsed["title"]
+        author = parsed["author"]
+        text = parsed["text"]
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Ошибка чтения файла: {str(e)}")
+
+    # Сохраняем в базу
+    methodic = MethodicEntry(
+        source_title=title,
+        author=author,
+        methodic_text=text
+    )
+    db.add(methodic)
+    db.commit()
+    db.refresh(methodic)
+
+    # Формируем сниппет
+    snippet = text[:300] + "..." if len(text) > 300 else text
+
+    return MethodicSnippet(
+        id=methodic.id,
+        title=title,
+        author=author,
+        content_snippet=snippet
     )
 
 
