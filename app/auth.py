@@ -1,47 +1,18 @@
-from fastapi import FastAPI, Request, Response, HTTPException
+from fastapi import Request, Response, HTTPException, Depends
+from sqlalchemy.orm import Session
 import redis
-import sqlite3
 import secrets
 import bcrypt
 import json
 import time
 
-app = FastAPI()
-
+from database import get_db
+from models import User
 
 # Redis для сессий
-
 r = redis.Redis(host="localhost", port=6379, decode_responses=True)
-SESSION_TTL = 60 * 60 * 24  
+SESSION_TTL = 60 * 60 * 24
 
-
-def get_connection():
-    conn = sqlite3.connect("app.db")
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db():
-    conn = get_connection()
-    cur = conn.cursor()
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        email TEXT UNIQUE NOT NULL,
-        password_hash TEXT NOT NULL
-    )
-    """)
-
-    conn.commit()
-    conn.close()
-
-
-init_db()
-
-
-
-# Сессии
 
 def generate_token():
     return secrets.token_hex(32)
@@ -49,12 +20,14 @@ def generate_token():
 
 def create_session(user_id=None):
     token = generate_token()
+
     session_data = {
         "user_id": user_id,
         "authenticated": bool(user_id),
         "created_at": time.time(),
         "history": []
     }
+
     r.setex(token, SESSION_TTL, json.dumps(session_data))
     return token
 
@@ -74,110 +47,103 @@ def delete_session(token):
     r.delete(token)
 
 
+def init_auth(app):
+    # REGISTER
+    @app.post("/register")
+    async def register(request: Request, db: Session = Depends(get_db)):
+        data = await request.json()
+        email = data["email"]
+        password = data["password"]
 
-# register
+        password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
-@app.post("/register")
-async def register(request: Request):
-    data = await request.json()
-    email = data["email"]
-    password = data["password"]
-
-    password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
-
-    conn = get_connection()
-    cur = conn.cursor()
-
-    try:
-        cur.execute(
-            "INSERT INTO users (email, password_hash) VALUES (?, ?)",
-            (email, password_hash)
+        user = User(
+            email=email,
+            password_hash=password_hash
         )
-        conn.commit()
-    except sqlite3.IntegrityError:
-        conn.close()
-        raise HTTPException(status_code=400, detail="User already exists")
 
-    conn.close()
-    return {"message": "User created"}
+        db.add(user)
 
+        try:
+            db.commit()
+        except:
+            db.rollback()
+            raise HTTPException(status_code=400, detail="User already exists")
 
-# LOGIN
+        return {"message": "User created"}
 
-@app.post("/login")
-async def login(request: Request, response: Response):
-    data = await request.json()
-    email = data["email"]
-    password = data["password"]
+    # LOGIN
+    @app.post("/login")
+    async def login(request: Request, response: Response, db: Session = Depends(get_db)):
+        data = await request.json()
+        email = data["email"]
+        password = data["password"]
 
-    conn = get_connection()
-    cur = conn.cursor()
+        user = db.query(User).filter(User.email == email).first()
 
-    cur.execute(
-        "SELECT id, password_hash FROM users WHERE email = ?",
-        (email,)
-    )
-    user = cur.fetchone()
-    conn.close()
+        if not user:
+            raise HTTPException(status_code=401)
 
-    if not user:
-        raise HTTPException(status_code=401)
+        if not bcrypt.checkpw(password.encode(), user.password_hash.encode()):
+            raise HTTPException(status_code=401)
 
-    user_id = user["id"]
-    password_hash = user["password_hash"]
+        # защита от session fixation
+        old_token = request.cookies.get("session_token")
+        if old_token:
+            delete_session(old_token)
 
-    if not bcrypt.checkpw(password.encode(), password_hash.encode()):
-        raise HTTPException(status_code=401)
+        token = create_session(user.id)
 
-    # защита от session fixation
-    old_token = request.cookies.get("session_token")
-    if old_token:
-        delete_session(old_token)
+        response.set_cookie(
+            key="session_token",
+            value=token,
+            httponly=True,
+            secure=False,
+            samesite="Lax"
+        )
 
-    token = create_session(user_id)
+        return {"message": "Logged in"}
 
-    response.set_cookie(
-        key="session_token",
-        value=token,
-        httponly=True,
-        secure=False,  # True на продакшене (HTTPS)
-        samesite="Lax"
-    )
+    # LOGOUT
+    @app.post("/logout")
+    def logout(request: Request, response: Response):
+        token = request.cookies.get("session_token")
 
-    return {"message": "Logged in"}
+        if token:
+            delete_session(token)
 
+        response.delete_cookie("session_token")
 
-# logout
+        return {"message": "Logged out"}
 
-@app.post("/logout")
-def logout(request: Request, response: Response):
-    token = request.cookies.get("session_token")
-    if token:
-        delete_session(token)
-    response.delete_cookie("session_token")
-    return {"message": "Logged out"}
+    # PROTECTED CHAT
+    @app.post("/chat")
+    async def chat(request: Request):
+        token = request.cookies.get("session_token")
 
+        if not token:
+            raise HTTPException(status_code=401)
 
-# chat
+        session = get_session(token)
 
-@app.post("/chat")
-async def chat(request: Request):
-    token = request.cookies.get("session_token")
-    if not token:
-        raise HTTPException(status_code=401)
+        if not session or not session["authenticated"]:
+            raise HTTPException(status_code=403)
 
-    session = get_session(token)
-    if not session or not session["authenticated"]:
-        raise HTTPException(status_code=403)
+        data = await request.json()
+        message = data.get("message", "")
 
-    data = await request.json()
-    message = data.get("message", "")
+        session["history"].append({
+            "role": "user",
+            "content": message
+        })
 
-    session["history"].append({"role": "user", "content": message})
+        ai_reply = f"Ответ по теме: {message}"
 
-    ai_reply = f"Ответ по теме: {message}"
-    session["history"].append({"role": "assistant", "content": ai_reply})
+        session["history"].append({
+            "role": "assistant",
+            "content": ai_reply
+        })
 
-    save_session(token, session)
+        save_session(token, session)
 
-    return {"reply": ai_reply}
+        return {"reply": ai_reply}

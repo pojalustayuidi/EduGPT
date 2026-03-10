@@ -5,6 +5,8 @@ from sqlalchemy.orm import Session
 from typing import List, Optional
 import requests
 import re
+
+from app import auth
 from database import get_db, init_db
 from models import MethodicEntry, QAEntry
 from search import (
@@ -17,6 +19,7 @@ from config import settings
 from pydantic import BaseModel
 
 app = FastAPI(title="Methodics Chat Bot (Dual Database)", version="3.1.0")
+auth.init_auth(app)
 
 # ------------------ CORS ------------------
 app.add_middleware(
