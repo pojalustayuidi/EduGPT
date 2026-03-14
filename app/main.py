@@ -7,15 +7,15 @@ import requests
 import re
 
 from app import auth
-from database import get_db, init_db
-from models import MethodicEntry, QAEntry
-from search import (
+from app.database import get_db, init_db
+from app.models import MethodicEntry, QAEntry
+from app.search import (
     search_methodics_with_context,
     format_context_for_prompt,
     search_qa_entries,
     search_methodic_texts
 )
-from config import settings
+from app.config import settings
 from pydantic import BaseModel
 
 app = FastAPI(title="Methodics Chat Bot (Dual Database)", version="3.1.0")

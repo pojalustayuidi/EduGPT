@@ -1,16 +1,52 @@
 from fastapi import Request, Response, HTTPException, Depends
 from sqlalchemy.orm import Session
+from pydantic import BaseModel, EmailStr
 import redis
 import secrets
 import bcrypt
 import json
 import time
+import os
 
-from database import get_db
-from models import User
+from app.database import get_db
+from app.models import User
 
-# Redis для сессий
-r = redis.Redis(host="localhost", port=6379, decode_responses=True)
+
+# Pydantic модели для запросов
+class RegisterRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class ChatRequest(BaseModel):
+    message: str
+
+
+# Redis для сессий - БЕРЁМ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+
+try:
+    r = redis.Redis(
+        host=REDIS_HOST,
+        port=REDIS_PORT,
+        decode_responses=True,
+        socket_connect_timeout=3
+    )
+    r.ping()
+    print(f"Redis подключен к {REDIS_HOST}:{REDIS_PORT}")
+    REDIS_AVAILABLE = True
+except Exception as e:
+    print(f"Redis не доступен: {e}")
+    REDIS_AVAILABLE = False
+    # Запасной вариант - словарь в памяти
+    sessions_store = {}
+
 SESSION_TTL = 60 * 60 * 24
 
 
@@ -20,7 +56,6 @@ def generate_token():
 
 def create_session(user_id=None):
     token = generate_token()
-
     session_data = {
         "user_id": user_id,
         "authenticated": bool(user_id),
@@ -28,32 +63,48 @@ def create_session(user_id=None):
         "history": []
     }
 
-    r.setex(token, SESSION_TTL, json.dumps(session_data))
+    if REDIS_AVAILABLE:
+        r.setex(token, SESSION_TTL, json.dumps(session_data))
+    else:
+        sessions_store[token] = session_data
+
     return token
 
 
 def get_session(token):
-    data = r.get(token)
-    if not data:
-        return None
-    return json.loads(data)
+    if REDIS_AVAILABLE:
+        data = r.get(token)
+        if not data:
+            return None
+        return json.loads(data)
+    else:
+        return sessions_store.get(token)
 
 
 def save_session(token, session_data):
-    r.setex(token, SESSION_TTL, json.dumps(session_data))
+    if REDIS_AVAILABLE:
+        r.setex(token, SESSION_TTL, json.dumps(session_data))
+    else:
+        sessions_store[token] = session_data
 
 
 def delete_session(token):
-    r.delete(token)
+    if REDIS_AVAILABLE:
+        r.delete(token)
+    else:
+        if token in sessions_store:
+            del sessions_store[token]
 
 
 def init_auth(app):
     # REGISTER
     @app.post("/register")
-    async def register(request: Request, db: Session = Depends(get_db)):
-        data = await request.json()
-        email = data["email"]
-        password = data["password"]
+    async def register(
+            body: RegisterRequest,
+            db: Session = Depends(get_db)
+    ):
+        email = body.email
+        password = body.password
 
         password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
@@ -74,10 +125,14 @@ def init_auth(app):
 
     # LOGIN
     @app.post("/login")
-    async def login(request: Request, response: Response, db: Session = Depends(get_db)):
-        data = await request.json()
-        email = data["email"]
-        password = data["password"]
+    async def login(
+            http_request: Request,
+            body: LoginRequest,
+            response: Response,
+            db: Session = Depends(get_db)
+    ):
+        email = body.email
+        password = body.password
 
         user = db.query(User).filter(User.email == email).first()
 
@@ -88,7 +143,7 @@ def init_auth(app):
             raise HTTPException(status_code=401)
 
         # защита от session fixation
-        old_token = request.cookies.get("session_token")
+        old_token = http_request.cookies.get("session_token")
         if old_token:
             delete_session(old_token)
 
@@ -118,8 +173,11 @@ def init_auth(app):
 
     # PROTECTED CHAT
     @app.post("/chat")
-    async def chat(request: Request):
-        token = request.cookies.get("session_token")
+    async def chat(
+            body: ChatRequest,
+            http_request: Request
+    ):
+        token = http_request.cookies.get("session_token")
 
         if not token:
             raise HTTPException(status_code=401)
@@ -129,8 +187,7 @@ def init_auth(app):
         if not session or not session["authenticated"]:
             raise HTTPException(status_code=403)
 
-        data = await request.json()
-        message = data.get("message", "")
+        message = body.message
 
         session["history"].append({
             "role": "user",

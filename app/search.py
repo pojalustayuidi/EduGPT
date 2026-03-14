@@ -1,6 +1,6 @@
 from sqlalchemy.orm import Session
 from sqlalchemy import or_, and_
-from models import MethodicEntry, QAEntry
+from app.models import MethodicEntry, QAEntry
 import re
 from difflib import SequenceMatcher
 from typing import List, Dict, Optional, Tuple
