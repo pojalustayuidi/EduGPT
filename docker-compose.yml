@@ -1,0 +1,84 @@
+version: '3.8'
+
+services:
+  # PostgreSQL база данных
+  postgres:
+    image: postgres:15
+    container_name: edugpt_postgres
+    environment:
+      POSTGRES_USER: edugpt
+      POSTGRES_PASSWORD: edugpt123
+      POSTGRES_DB: edugpt_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U edugpt"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - edugpt_network
+
+  # Redis для сессий
+  redis:
+    image: redis:7-alpine
+    container_name: edugpt_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - edugpt_network
+
+  # FastAPI приложение
+  app:
+    build: .
+    container_name: edugpt_app
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://edugpt:edugpt123@postgres:5432/edugpt_db
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_API_URL=${GEMINI_API_URL}
+    volumes:
+      - ./:/app  # Для hot-reload в разработке
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - edugpt_network
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Админка для PostgreSQL (опционально)
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: edugpt_pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@edugpt.com
+      PGADMIN_DEFAULT_PASSWORD: admin123
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+    networks:
+      - edugpt_network
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  edugpt_network:
+    driver: bridge
