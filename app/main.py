@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from typing import List, Optional
 import requests
 import re
-
+from docx import Document
 from app import auth
 from app.database import get_db, init_db
 from app.models import MethodicEntry, QAEntry
@@ -81,70 +81,97 @@ def detect_question_type(question: str) -> str:
 
 
 # ------------------ HELPERS ------------------
+def fix_text(text: str) -> str:
+    """
+    Нормализует текст:
+    - убирает лишние пробелы
+    - пытается частично исправить склеенные фрагменты
+    """
+    if not text:
+        return ""
+
+    text = re.sub(r'\s+', ' ', text).strip()
+
+    # частичная правка слепленных слов вида "текствузе"
+    text = re.sub(r'([а-яё])([А-ЯA-Z])', r'\1 \2', text)
+
+    # правка пробелов перед знаками препинания
+    text = re.sub(r'\s+([.,!?;:])', r'\1', text)
+
+    return text.strip()
+
+
 def is_quality_answer(answer: str, question: str) -> bool:
     """
-    Проверяет качество ответа от Gemini
+    Упрощенная проверка качества ответа от Gemini.
+    Не режем хорошие ответы слишком агрессивно.
     """
-    if not answer or len(answer.strip()) < 30:
+    if not answer:
         return False
 
-    if answer.count('•') > 10 or answer.count('\n-') > 10:
+    answer = fix_text(answer)
+
+    if len(answer.strip()) < 80:
         return False
 
-    keywords = re.findall(r'\w+', question.lower())
-    keywords = [k for k in keywords if len(k) > 3]
-
-    if keywords:
-        answer_lower = answer.lower()
-        matches = sum(1 for kw in keywords if kw in answer_lower)
-        if matches < max(1, len(keywords) * 0.3):
-            return False
-
-    sentences = re.split(r'[.!?]+', answer)
-    if len(sentences) > 8 and len(answer) < 200:
+    bad_markers = [
+        "не могу ответить",
+        "недостаточно информации",
+        "контекст не содержит",
+        "не найдено информации"
+    ]
+    answer_lower = answer.lower()
+    if any(marker in answer_lower for marker in bad_markers):
         return False
 
     return True
 
-
 def call_gemini_api(question: str, context: str) -> str:
     """
-    Gemini используется только как инструмент для обобщения контекста.
+    Gemini используется как инструмент для краткого и понятного
+    ответа строго по найденному контексту.
     """
     instruction = f"""
-    Ты — методист.
+Ты — эксперт по педагогике высшего образования.
 
-    ОБЯЗАТЕЛЬНО:
-    1. Назови метод или подход
-    2. Кратко объясни, почему он эффективен
-    3. Ответ должен быть универсальным
-    4. Используй ТОЛЬКО предоставленный контекст
+Ответь на вопрос, используя ТОЛЬКО предоставленный контекст.
 
-    ВОПРОС:
-    {question}
+Правила ответа:
+1. Сначала кратко ответь на вопрос 1-2 предложениями.
+2. Затем, если уместно, перечисли 2-4 ключевые особенности или вывода.
+3. Не копируй контекст дословно большими кусками.
+4. Не придумывай факты, которых нет в контексте.
+5. Если информации недостаточно, так и напиши.
+6. Пиши простым, понятным, академически нейтральным языком.
 
-    КОНТЕКСТ:
-    {context[:5000]}
+Вопрос:
+{question}
 
+Контекст:
+{context[:5000]}
 
-ОТВЕТ (только на основе контекста):"""
+Ответ:
+"""
 
     url = f"{settings.GEMINI_API_URL}?key={settings.GEMINI_API_KEY}"
     headers = {"Content-Type": "application/json"}
     body = {
         "contents": [{"parts": [{"text": instruction}]}],
         "generationConfig": {
-            "temperature": 0.2,
-            "maxOutputTokens": 800,
-            "topP": 0.8
+            "temperature": 0.3,
+            "maxOutputTokens": 700,
+            "topP": 0.9,
+            "topK": 40
         }
     }
 
     try:
         resp = requests.post(url, headers=headers, json=body, timeout=30)
+
         if resp.status_code != 200:
-            print(f"Ошибка Gemini: {resp.status_code} - {resp.text[:200]}")
+            print(f"Ошибка Gemini: {resp.status_code} - {resp.text[:300]}")
             return ""
+
         data = resp.json()
         answer = (
             data.get("candidates", [{}])[0]
@@ -153,7 +180,9 @@ def call_gemini_api(question: str, context: str) -> str:
             .get("text", "")
             .strip()
         )
-        return answer
+
+        return fix_text(answer)
+
     except Exception as e:
         print(f"Ошибка обращения к Gemini: {e}")
         return ""
@@ -167,47 +196,75 @@ def synthesize_answer(search_results: dict, question: str) -> str:
         return "В методических материалах не найдено информации по данному вопросу."
 
     sentences = []
+    seen = set()
+
+    # Собираем предложения из найденных методичек
     for ctx in contexts:
-        sentences.extend(ctx.get("relevant_sentences", []))
+        for s in ctx.get("relevant_sentences", []):
+            s = fix_text(s)
+            key = s.lower()
 
-    clean_sentences = []
-    for s in sentences:
-        s = re.sub(r'\s+', ' ', s).strip()
-        if len(s) >= 40:
-            clean_sentences.append(s)
+            if len(s) >= 50 and key not in seen:
+                sentences.append(s)
+                seen.add(key)
 
-    if not clean_sentences:
+    if not sentences:
         return "В методических материалах отсутствует содержательная информация по данному вопросу."
 
-    core = clean_sentences[0]
+    # Берём до 3 лучших фрагментов
+    top_sentences = sentences[:3]
 
     # -------- МЕТОДЫ --------
     if q_type == "methods":
-        return (
-            "Одним из эффективных методов является погружение обучающихся "
-            "в реальную профессиональную или образовательную среду. "
-            f"{core} "
-            "Такой подход способствует переходу от пассивного интереса "
-            "к осознанной и устойчивой мотивации."
-        )
+        answer_parts = [
+            "По найденным методическим материалам можно выделить следующие методы и подходы:"
+        ]
+        for i, sentence in enumerate(top_sentences, 1):
+            answer_parts.append(f"{i}. {sentence}")
+        return " ".join(answer_parts)
 
     # -------- ОПРЕДЕЛЕНИЕ --------
     if q_type == "definition":
-        return (
-            f"{core} "
-            "Данный подход используется в образовательной практике "
-            "для повышения качества обучения и профессионального развития."
-        )
+        first = top_sentences[0]
+        rest = top_sentences[1:3]
+
+        answer_parts = [
+            f"По методическим материалам суть понятия можно описать так: {first}"
+        ]
+
+        if rest:
+            answer_parts.append("Дополнительно можно выделить следующее:")
+            for i, sentence in enumerate(rest, 1):
+                answer_parts.append(f"{i}. {sentence}")
+
+        return " ".join(answer_parts)
 
     # -------- РОЛЬ --------
     if q_type == "role":
-        return (
-            "Ключевая роль в данном процессе принадлежит наставнику или преподавателю. "
-            f"{core}"
-        )
+        answer_parts = [
+            "По найденным материалам ключевая роль заключается в следующем:"
+        ]
+        for i, sentence in enumerate(top_sentences, 1):
+            answer_parts.append(f"{i}. {sentence}")
+        return " ".join(answer_parts)
+
+    # -------- ПРЕИМУЩЕСТВА --------
+    if q_type == "advantages":
+        answer_parts = [
+            "По найденным материалам можно выделить следующие преимущества:"
+        ]
+        for i, sentence in enumerate(top_sentences, 1):
+            answer_parts.append(f"{i}. {sentence}")
+        return " ".join(answer_parts)
 
     # -------- ОБЩИЙ СЛУЧАЙ --------
-    return core
+    answer_parts = [
+        "По найденным методическим материалам можно выделить следующее:"
+    ]
+    for i, sentence in enumerate(top_sentences, 1):
+        answer_parts.append(f"{i}. {sentence}")
+
+    return " ".join(answer_parts)
 
 
 def parse_methodic_docx(file) -> dict:
@@ -236,7 +293,7 @@ def parse_methodic_docx(file) -> dict:
             raise ValueError("Пустой документ")
         author = paragraphs[0] if len(paragraphs) > 0 else None
         title = paragraphs[1] if len(paragraphs) > 1 else "Без названия"
-        text = "\n".join(paragraphs[2:]) if len(paragraphs) > 2 else ""
+        text = " ".join(paragraphs[2:]) if len(paragraphs) > 2 else ""
 
     return {
         "title": title,
@@ -257,7 +314,7 @@ async def chat_with_methodics(
     3. Если нет - ищем в methodic_entries и обрабатываем через Gemini
     4. Проверяем качество ответа от Gemini
     """
-    print(f"\n{'=' * 50}")
+    print(f" {'=' * 50}")
     print(f"Вопрос: {request.question}")
 
     # --- Шаг 1: Ищем в базе готовых Q&A ---
@@ -273,8 +330,8 @@ async def chat_with_methodics(
             # Объединяем несколько ответов
             answer_parts = ["Найдено несколько похожих вопросов:"]
             for i, qa in enumerate(qa_results[:3], 1):  # Берем до 3 ответов
-                answer_parts.append(f"\n{i}. {qa.answer}")
-            answer = "\n".join(answer_parts)
+                answer_parts.append(f" {i}. {qa.answer}")
+            answer = " ".join(answer_parts)
 
 
         sources = []

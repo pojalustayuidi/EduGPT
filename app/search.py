@@ -1,11 +1,8 @@
 from sqlalchemy.orm import Session
-from sqlalchemy import or_, and_
 from app.models import MethodicEntry, QAEntry
 import re
 from difflib import SequenceMatcher
-from typing import List, Dict, Optional, Tuple
-import math
-from collections import Counter
+from typing import List, Dict
 
 
 # ========== Классы для анализа текста и поиска ==========
@@ -15,22 +12,27 @@ class TextAnalyzer:
 
     @staticmethod
     def clean_text_for_search(text: str) -> str:
-        """Очищает текст для поиска"""
+        """Очищает текст для поиска без склеивания слов"""
         if not text:
             return ""
 
         text = re.sub(r'\s+', ' ', text.strip())
 
-        text = re.sub(r'(\w+)-\s+(\w+)', r'\1\2', text)
+        # Склеиваем только перенос слова с дефисом на стыке строк:
+        # "инновацион-\nная" -> "инновационная"
+        text = re.sub(r'(\w)-\s+(\w)', r'\1\2', text)
 
-        text = re.sub(r'(\w+)[-\s]+\s*(\w+)', r'\1\2', text)
+        # Убираем пробелы перед знаками препинания
+        text = re.sub(r'\s+([.,!?;:])', r'\1', text)
+
+        # Добавляем пробел после знака препинания, если его нет
+        text = re.sub(r'([.,!?;:])([А-ЯA-Zа-яa-z])', r'\1 \2', text)
 
         return text
 
     @staticmethod
     def extract_keywords(text: str, min_length: int = 3) -> List[str]:
         """Извлекает ключевые слова из текста"""
-        # Убираем стоп-слова
         stop_words = {
             'это', 'что', 'как', 'для', 'или', 'из', 'на', 'по', 'от', 'до',
             'во', 'со', 'при', 'без', 'над', 'под', 'перед', 'после', 'в', 'и',
@@ -38,28 +40,28 @@ class TextAnalyzer:
             'к', 'ко', 'с', 'со', 'по', 'про', 'через'
         }
 
-        # Находим все слова
         words = re.findall(r'\b\w+\b', text.lower())
-
-        # Фильтруем короткие слова и стоп-слова
         keywords = [w for w in words if len(w) >= min_length and w not in stop_words]
 
         return list(set(keywords))
 
     @staticmethod
     def clean_response_text(text: str) -> str:
-        """Очищает текст ответа от обрывков и лишних пробелов"""
+        """Очищает текст ответа без склеивания слов"""
         if not text:
             return ""
 
         text = re.sub(r'\s+', ' ', text.strip())
 
-        text = re.sub(r'(\b\w+)[-\s]+\s*(\w+\b)', r'\1\2', text)
-
+        # Убираем пробелы перед пунктуацией
         text = re.sub(r'\s+([.,!?;:])', r'\1', text)
-        text = re.sub(r'([.,!?;:])(\w)', r'\1 \2', text)
 
-        text = re.sub(r'(\b[а-яa-z]+)[-\s]+(\d+[а-яa-z]*)', r'\1\2', text)
+        # Добавляем пробел после пунктуации, если его нет
+        text = re.sub(r'([.,!?;:])([А-ЯA-Zа-яa-z])', r'\1 \2', text)
+
+        # Нормализуем пробелы возле скобок
+        text = re.sub(r'\(\s+', '(', text)
+        text = re.sub(r'\s+\)', ')', text)
 
         return text
 
@@ -106,8 +108,10 @@ class SearchEngine:
 
         query_lower = query.lower()
         if "профессиональные обучающиеся сообщества" in query_lower:
-            keywords.extend(["профессиональные", "обучающиеся", "сообщества",
-                             "сообщество", "практик", "развитие", "педагог", "учитель"])
+            keywords.extend([
+                "профессиональные", "обучающиеся", "сообщества",
+                "сообщество", "практик", "развитие", "педагог", "учитель"
+            ])
         elif "что такое" in query_lower:
             keywords.extend(["это", "является", "означает", "определяется"])
 
@@ -129,8 +133,12 @@ class SearchEngine:
 
         return [item['methodic'] for item in scored_results[:limit]]
 
-    def _calculate_methodic_relevance(self, methodic: MethodicEntry,
-                                      keywords: List[str], query: str) -> float:
+    def _calculate_methodic_relevance(
+        self,
+        methodic: MethodicEntry,
+        keywords: List[str],
+        query: str
+    ) -> float:
         """Вычисляет релевантность методички"""
         score = 0.0
 
@@ -144,7 +152,8 @@ class SearchEngine:
                 if "профессиональные обучающиеся сообщества" in title_lower:
                     score += 20.0
                 elif "сообщества" in title_lower and (
-                        "профессиональные" in title_lower or "обучающиеся" in title_lower):
+                    "профессиональные" in title_lower or "обучающиеся" in title_lower
+                ):
                     score += 15.0
 
         if methodic.methodic_text:
@@ -170,8 +179,10 @@ class SearchEngine:
                 for sentence in sentences[:20]:
                     sentence_lower = sentence.lower()
                     has_keywords = any(keyword in sentence_lower for keyword in keywords[:3])
-                    is_definition = any(marker in sentence_lower.split()[:3]
-                                        for marker in ['это', 'является', 'означает', 'определяется'])
+                    is_definition = any(
+                        marker in sentence_lower.split()[:3]
+                        for marker in ['это', 'является', 'означает', 'определяется']
+                    )
 
                     if has_keywords and is_definition:
                         score += 10.0
@@ -179,8 +190,12 @@ class SearchEngine:
 
         return score
 
-    def find_relevant_sentences(self, text: str, keywords: List[str],
-                                max_sentences: int = 3) -> List[str]:
+    def find_relevant_sentences(
+        self,
+        text: str,
+        keywords: List[str],
+        max_sentences: int = 3
+    ) -> List[str]:
         """
         Находит наиболее релевантные предложения в тексте
         """
@@ -199,7 +214,6 @@ class SearchEngine:
                 continue
 
             sentence_lower = sentence.lower()
-
             score = 0.0
 
             for keyword in keywords:
@@ -211,9 +225,10 @@ class SearchEngine:
                 score += matches * 2.0
 
             if score > 0:
-
-                if any(marker in sentence_lower.split()[:3]
-                       for marker in ['это', 'является', 'означает', 'определяется']):
+                if any(
+                    marker in sentence_lower.split()[:3]
+                    for marker in ['это', 'является', 'означает', 'определяется']
+                ):
                     score += 5.0
 
                 if sentence.endswith(('.', '!', '?', '»')):
@@ -239,10 +254,8 @@ class SearchEngine:
         for item in scored_sentences[:max_sentences * 3]:
             sent = item['sentence']
 
-            if re.search(r'\b[а-яa-z]+[-\s]+\s*\b', sent):
-                sent = re.sub(r'(\b[а-яa-z]+)[-\s]+\s*(\b[а-яa-z]+)', r'\1\2', sent)
-
-            if re.search(r'\b[а-яa-z]+-\s*\d+\b', sent):
+            # Пропускаем мусорные шаблоны вида "слово-123"
+            if re.search(r'\b[а-яa-z]+-\s*\d+\b', sent.lower()):
                 continue
 
             sent_key = sent[:80].lower()
@@ -256,15 +269,13 @@ class SearchEngine:
 
         return result
 
-    def search_methodics_with_context(self, db: Session, question: str,
-                                      limit: int = 5) -> Dict:
+    def search_methodics_with_context(self, db: Session, question: str, limit: int = 5) -> Dict:
         """
         Основная функция поиска с контекстом
         """
         qa_results = self.search_qa_entries(db, question, limit=limit)
 
         keywords = TextAnalyzer.extract_keywords(question, min_length=3)
-
         methodic_results = self.search_methodic_texts(db, question, limit)
 
         methodic_contexts = []
@@ -307,7 +318,7 @@ class ResponseFormatter:
     @staticmethod
     def format_definition_answer(search_results: dict, question: str) -> str:
         """
-        Форматирует ответ на вопрос о определении
+        Форматирует ответ на вопрос об определении
         """
         parts = ["**Ответ на основе методических материалов:**"]
 
@@ -319,14 +330,17 @@ class ResponseFormatter:
         definition_found = False
 
         for ctx in search_results.get('methodic_contexts', []):
-            methodic = ctx['methodic']
             source_title = ctx['source_title']
 
             for sentence in ctx.get('relevant_sentences', []):
                 sentence_lower = sentence.lower()
-                is_definition = any(marker in sentence_lower.split()[:3]
-                                    for marker in ['это', 'является', 'означает', 'определяется',
-                                                   'подразумевает', 'представляет собой'])
+                is_definition = any(
+                    marker in sentence_lower.split()[:3]
+                    for marker in [
+                        'это', 'является', 'означает', 'определяется',
+                        'подразумевает', 'представляет собой'
+                    ]
+                )
 
                 if is_definition or "профессиональные обучающиеся сообщества" in sentence_lower:
                     clean_sentence = TextAnalyzer.clean_response_text(sentence)
@@ -340,13 +354,14 @@ class ResponseFormatter:
                 break
 
         if not definition_found:
-            parts.append("\nВ методических материалах не найдено четкого определения, но есть следующая информация:")
+            parts.append(
+                "\nВ методических материалах не найдено четкого определения, но есть следующая информация:"
+            )
 
             relevant_info = []
             sources_used = set()
 
             for ctx in search_results.get('methodic_contexts', []):
-                methodic = ctx['methodic']
                 source_title = ctx['source_title']
 
                 if source_title in sources_used:
@@ -366,7 +381,9 @@ class ResponseFormatter:
                 parts.extend(relevant_info)
                 parts.append(f"\n**Источники:** {', '.join(list(sources_used)[:3])}")
             else:
-                parts.append("\nК сожалению, в методических материалах не найдено информации по данному вопросу.")
+                parts.append(
+                    "\nК сожалению, в методических материалах не найдено информации по данному вопросу."
+                )
                 parts.append("Рекомендуется обратиться к дополнительным источникам.")
 
         return "\n".join(parts)
@@ -389,7 +406,6 @@ class ResponseFormatter:
         sources_used = set()
 
         for ctx in search_results.get('methodic_contexts', []):
-            methodic = ctx['methodic']
             source_title = ctx['source_title']
 
             if source_title in sources_used:
@@ -450,7 +466,6 @@ def get_enhanced_answer(db: Session, question: str) -> str:
     engine = SearchEngine()
     formatter = ResponseFormatter()
     search_results = engine.search_methodics_with_context(db, question)
-
     return formatter.create_clean_response(search_results, question)
 
 

@@ -11,5 +11,7 @@ class Settings(BaseSettings):
         env_file = ".env"
         env_file_encoding = "utf-8"
 
-
-settings = Settings()
+# GEMINI_API_URL=https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent
+# GEMINI_API_KEY=AIzaSyD8Q8sZLn89PZPers0a9B_Swfpoef72W20
+settings = Settings(
+)

@@ -172,7 +172,7 @@ def init_auth(app):
         return {"message": "Logged out"}
 
     # PROTECTED CHAT
-    @app.post("/chat")
+    @app.post("/auth/chat")
     async def chat(
             body: ChatRequest,
             http_request: Request
